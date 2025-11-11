@@ -20,7 +20,7 @@ services:
       - "6379:6379"
 
   api:
-    build: .
+    image: sirartem001/scrapers-api:v1 # Добавил в registry свой код
     restart: always
     environment:
       DATABASE_DSN: postgres://bdu_user:bdu_pass@postgres:5432/bdu_db
