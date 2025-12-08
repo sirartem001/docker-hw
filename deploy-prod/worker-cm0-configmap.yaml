@@ -1,0 +1,719 @@
+apiVersion: v1
+data:
+  .env: |-
+    DATABASE_DSN="host=localhost port=5432 dbname=bdu_fstek user=user password=pass"
+    NVD_API_KEY="c166d610-21fb-4beb-8797-8a4d4b0a1975"
+  .gitignore: |-
+    .DS_STORE
+    __pycache__
+    *.pyc
+  Dockerfile: |
+    FROM python:3.11-slim
+
+    WORKDIR /app
+
+    RUN apt-get update && apt-get install -y \
+        curl \
+        libpq-dev \
+        gcc \
+        && rm -rf /var/lib/apt/lists/*
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    RUN pip install playwright && playwright install --with-deps chromium
+
+    COPY . .
+
+    CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+  README.md: домашка 2
+  api.py: |
+    from fastapi import FastAPI, HTTPException
+    from celery.result import AsyncResult
+    from typing import Any, Dict
+
+    from tasks import (
+        enqueue_vuln_links,
+        fetch_and_store_vuln,
+        enqueue_cpe_chunks,
+        fetch_and_store_cpe_chunk,
+        enqueue_all_bdu_pages
+    )
+    from celery_app import celery
+
+    app = FastAPI()
+
+    @app.post("/scrape/page/{page_number}")
+    def trigger_scrape_page(page_number: int = 1) -> Dict[str, Any]:
+        """Запустить задачу для страницы списка уязвимостей."""
+        task = enqueue_vuln_links.delay(page_number)
+        return {"task_id": task.id, "message": "Task queued for vuln list page"}
+
+    @app.post("/scrape/vuln")
+    def trigger_scrape_vuln(url: str) -> Dict[str, Any]:
+        """Запустить парсинг одной уязвимости по URL."""
+        task = fetch_and_store_vuln.delay(url)
+        return {"task_id": task.id, "message": "Task queued for single vuln"}
+
+    @app.get("/tasks/{task_id}")
+    def get_task_status(task_id: str):
+        res = AsyncResult(task_id, app=celery)
+        return {
+            "task_id": task_id,
+            "status": res.status,
+            "result": res.result if res.ready() else None,
+        }
+
+    @app.get("/celery/stats")
+    def get_celery_stats():
+        insp = celery.control.inspect()
+        stats = insp.stats() or {}
+        active = insp.active() or {}
+        scheduled = insp.scheduled() or {}
+        reserved = insp.reserved() or {}
+        registered = insp.registered() or {}
+        return {
+            "stats": stats,
+            "active": active,
+            "scheduled": scheduled,
+            "reserved": reserved,
+            "registered_tasks": registered,
+        }
+
+    @app.post("/scrape/cpe/enqueue")
+    def trigger_enqueue_cpe() -> Dict[str, Any]:
+        """
+        Запустить задачу, которая разобьёт весь объём CPE на чанки и поставит задачи на загрузку.
+        """
+        task = enqueue_cpe_chunks.delay()
+        return {"task_id": task.id, "message": "Task queued for enqueueing CPE chunks"}
+
+    @app.post("/scrape/cpe/fetch")
+    def trigger_fetch_cpe_chunk(start_index: int) -> Dict[str, Any]:
+        """
+        Запустить задачу для загрузки одного чанка CPE, начиная с заданного индекса.
+        """
+        task = fetch_and_store_cpe_chunk.delay(start_index)
+        return {"task_id": task.id, "message": f"Task queued for CPE chunk at start_index={start_index}"}
+
+
+    @app.post("/scrape/bdu/all")
+    def trigger_scrape_all_bdu(start_page: int = 1, max_pages: int | None = None) -> Dict[str, Any]:
+        """
+        Запускает задачу, которая проходит все страницы БДУ и ставит задачи на парсинг каждой уязвимости.
+        Можно указать max_pages для ограничения числа страниц.
+        """
+        task = enqueue_all_bdu_pages.delay(start_page=start_page, max_pages=max_pages)
+        return {
+            "task_id": task.id,
+            "message": "Task queued for scraping all BDU pages",
+            "start_page": start_page,
+            "max_pages": max_pages,
+        }
+  bdu.py: |
+    import re
+    import json
+    from datetime import datetime
+    from typing import Optional, List, Dict
+
+    from bs4 import BeautifulSoup
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from psycopg2.extras import execute_values
+
+    DATE_RE = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
+    CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
+    BDU_ID_RE = re.compile(r"\bBDU[:\-\s]?(\d{4}-\d{5})\b", re.IGNORECASE)
+
+
+    BASE_URL = "https://bdu.fstec.ru"
+    LIST_PATH = "/vul"
+
+
+    def _extract_base_vector(soup: BeautifulSoup) -> Optional[str]:
+        for tr in soup.select("tr"):
+            first = tr.find(["td", "th"])
+            if not first:
+                continue
+            label = first.get_text(" ", strip=True).lower()
+            if any(x in label for x in ["базовый вектор", "base vector", "cvss", "вектор оценки", "вектор базовый"]):
+                tds = tr.find_all("td")
+                if len(tds) < 2:
+                    continue
+                cell = tds[1]
+                lis = cell.select("li")
+                if lis:
+                    return "; ".join(li.get_text(" ", strip=True) for li in lis if li.get_text(strip=True))
+                text = cell.get_text(" ", strip=True)
+                if text:
+                    m = re.search(r'AV:[A-Z]/AC:[A-Z]/PR:[A-Z]/UI:[A-Z]/S:[A-Z]/C:[A-Z]/I:[A-Z]/A:[A-Z]', text)
+                    if m:
+                        return m.group(0)
+                    return text
+        return None
+
+    def fetch_rendered(page, url: str, wait_selector: Optional[str] = None, timeout: int = 60000, retries: int = 3) -> str:
+        page.set_default_navigation_timeout(timeout)
+        page.set_default_timeout(timeout)
+        last_err = None
+        for _ in range(retries):
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                page.wait_for_selector(wait_selector or "table, ul.list-news", timeout=timeout)
+                return page.content()
+            except PlaywrightTimeoutError as e:
+                last_err = e
+            except Exception as e:
+                last_err = e
+        raise last_err
+
+
+    def _extract_date(text: str) -> Optional[datetime.date]:
+        if not text:
+            return None
+        m = DATE_RE.search(text)
+        if not m:
+            return None
+        try:
+            return datetime.strptime(m.group(1), "%d.%m.%Y").date()
+        except Exception:
+            return None
+
+
+    def _get_row(soup: BeautifulSoup, label_sub: str, multiple: bool = False, joiner: str = "; ") -> Optional[str]:
+        label_sub = label_sub.lower()
+        for tr in soup.select("tr"):
+            first = tr.find(["td", "th"])
+            if not first:
+                continue
+            if label_sub in first.get_text(" ", strip=True).lower():
+                tds = tr.find_all("td")
+                if len(tds) < 2:
+                    return None
+                if multiple:
+                    items = [li.get_text(" ", strip=True) for li in tds[1].select("li")]
+                    return joiner.join(i for i in items if i)
+                return tds[1].get_text("\n", strip=True)
+        return None
+
+
+    def _extract_discovered_date(soup: BeautifulSoup, html: str) -> Optional[datetime.date]:
+        v = _get_row(soup, "дата выявления")
+        if v:
+            return _extract_date(v)
+        idx = html.lower().find("дата выявления")
+        if idx != -1:
+            window = html[max(0, idx - 200): idx + 200]
+            return _extract_date(window)
+        return _extract_date(html)
+
+
+    def _extract_severity(soup: BeautifulSoup, html: str) -> Optional[str]:
+        v = _get_row(soup, "класс уязвимости") or _get_row(soup, "уровень опасности") or _get_row(soup, "критичн")
+        if v:
+            return v
+        for pattern in (r'v_model\.clv\.clv_name\s*[:=]\s*"([^"]+)"', r'cmp_vul_critu\s*[:=]\s*"([^"]+)"'):
+            m = re.search(pattern, html)
+            if m:
+                return m.group(1).strip()
+        return None
+
+
+    def parse_list_page(html: str) -> List[str]:
+        soup = BeautifulSoup(html, "lxml")
+        links = []
+        for a in soup.select("ul.list-news a"):
+            href = a.get("href")
+            if href and "/vul/" in href:
+                links.append(href)
+        for a in soup.select("a[href]"):
+            href = a["href"].strip()
+            if re.search(r"/vul/\d{4}-\d{5}", href):
+                links.append(href)
+        seen = set()
+        res = []
+        for u in links:
+            full = u if u.startswith("http") else BASE_URL.rstrip("/") + u
+            if full not in seen:
+                seen.add(full)
+                res.append(full)
+        return res
+
+
+    def parse_vuln_page(html: str, url: str) -> Dict:
+        soup = BeautifulSoup(html, "lxml")
+        title = None
+        if soup.find("h1"):
+            title = soup.find("h1").get_text(strip=True)
+        elif soup.title:
+            title = soup.title.get_text(strip=True)
+
+        m = BDU_ID_RE.search(html)
+        if m:
+            bdu_id = "BDU:" + m.group(1)
+        else:
+            part = url.rstrip("/").split("/")[-1]
+            bdu_id = "BDU:" + part if re.match(r"\d{4}-\d{5}", part) else part
+
+        discovered_date = _extract_discovered_date(soup, html)
+        severity = _extract_severity(soup, html)
+
+        base_vector = _extract_base_vector(soup)
+
+        error_type = None
+        for tr in soup.select("tr"):
+            first = tr.find(["td", "th"])
+            if not first:
+                continue
+            label = first.get_text(" ", strip=True).lower()
+            if "тип ошибки" in label:
+                tds = tr.find_all("td")
+                if len(tds) >= 2:
+                    links = []
+                    for a in tds[1].select("a[href]"):
+                        href = a["href"].strip()
+                        if href:
+                            links.append(href)
+                    text = " ".join(s.strip() for s in tds[1].stripped_strings)
+                    if links:
+                        text = f"{text} ({', '.join(links)})"
+                    error_type = text.strip()
+                break
+
+
+
+        crit_text = None
+        for tr in soup.select("tr"):
+            first = tr.find(["td", "th"])
+            if first and "уровень опасности" in first.get_text(" ", strip=True).lower():
+                tds = tr.find_all("td")
+                if len(tds) >= 2:
+                    crit_text = tds[1].get_text(" ", strip=True)
+                break
+
+        def get_row(label_sub: str) -> Optional[str]:
+            return _get_row(soup, label_sub)
+
+        status = get_row("статус уязвимости")
+        exploit = get_row("наличие эксплойта")
+        elimination = get_row("способ устранения")
+        infou = get_row("информация об устранении")
+
+        exploitation_mode = None
+        for tr in soup.select("tr"):
+            first = tr.find(["td", "th"])
+            if first and "способ эксплуатации" in first.get_text(" ", strip=True).lower():
+                tds = tr.find_all("td")
+                if len(tds) >= 2:
+                    lis = tds[1].select("li")
+                    exploitation_mode = "; ".join(li.get_text(" ", strip=True) for li in lis)
+                break
+
+        links = []
+        for tr in soup.select("tr"):
+            first = tr.find(["td", "th"])
+            if first and "ссылки на источники" in first.get_text(" ", strip=True).lower():
+                tds = tr.find_all("td")
+                if len(tds) >= 2:
+                    for a in tds[1].select("a[href]"):
+                        href = a["href"].strip()
+                        if href.startswith("http"):
+                            links.append(href)
+                break
+
+        idvals = []
+        for tr in soup.select("tr"):
+            first = tr.find(["td", "th"])
+            if first and "идентификаторы других систем" in first.get_text(" ", strip=True).lower():
+                tds = tr.find_all("td")
+                if len(tds) >= 2:
+                    for li in tds[1].select("li"):
+                        v = li.get_text(" ", strip=True)
+                        if v:
+                            idvals.append(v)
+                break
+
+        real_attack = get_row("эксплуатация в реальных атаках")
+
+        consequences = None
+        for tr in soup.select("tr"):
+            first = tr.find(["td", "th"])
+            if first and "последствия эксплуатации" in first.get_text(" ", strip=True).lower():
+                tds = tr.find_all("td")
+                if len(tds) >= 2:
+                    lis = tds[1].select("li")
+                    consequences = "; ".join(li.get_text(" ", strip=True) for li in lis)
+                break
+
+        pub_date = None
+        val = get_row("дата публикации")
+        if val:
+            pub_date = _extract_date(val)
+
+        upd_date = None
+        val2 = get_row("дата последнего обновления")
+        if val2:
+            upd_date = _extract_date(val2)
+
+        m_cve = CVE_RE.search(html)
+        cve = m_cve.group(0).upper() if m_cve else None
+        if not cve:
+            for it in idvals:
+                m2 = CVE_RE.search(it)
+                if m2:
+                    cve = m2.group(0).upper()
+                    break
+
+        return {
+            "bdu_id": bdu_id,
+            "title": title,
+            "discovered_date": discovered_date,
+            "severity": severity,
+            "base_vector": base_vector,
+            "crit_text": crit_text,
+            "cve": cve,
+            "status": status,
+            "recommendations": get_row("возможные меры по устранению"),
+            "exploit_exists": exploit,
+            "exploitation_mode": exploitation_mode,
+            "elimination": elimination,
+            "infou": infou,
+            "links": links,
+            "idvals": idvals,
+            "real_attack": real_attack,
+            "consequences": consequences,
+            "publication_date": pub_date,
+            "update_date": upd_date,
+            "error_type": error_type,
+            "other_info": None,
+        }
+
+
+    def store_bulk(conn, rows: List[Dict]):
+        if not rows:
+            return
+
+        cols = [
+            "bdu_id", "title", "discovered_date", "severity", "base_vector",
+            "crit_text", "cve", "status", "recommendations", "exploit_exists",
+            "exploitation_mode", "elimination", "infou", "links", "idvals",
+            "real_attack", "consequences", "publication_date", "update_date",
+            "other_info", "updated_at", "error_type"
+        ]
+
+        values = []
+        for r in rows:
+            # Безопасная сериализация JSON полей
+            links_val = r.get("links")
+            if not isinstance(links_val, (list, dict)):
+                links_val = [links_val] if links_val else []
+            links_json = json.dumps(links_val, ensure_ascii=False)
+
+            idvals_val = r.get("idvals")
+            if not isinstance(idvals_val, (list, dict)):
+                idvals_val = [idvals_val] if idvals_val else []
+            idvals_json = json.dumps(idvals_val, ensure_ascii=False)
+
+            values.append([
+                r.get("bdu_id"),
+                r.get("title"),
+                r.get("discovered_date"),
+                r.get("severity"),
+                r.get("base_vector"),
+                r.get("crit_text"),
+                r.get("cve"),
+                r.get("status"),
+                r.get("recommendations"),
+                r.get("exploit_exists"),
+                r.get("exploitation_mode"),
+                r.get("elimination"),
+                r.get("infou"),
+                links_json,
+                idvals_json,
+                r.get("real_attack"),
+                r.get("consequences"),
+                r.get("publication_date"),
+                r.get("update_date"),
+                r.get("other_info"),
+                datetime.utcnow(),
+                r.get("error_type"),
+            ])
+
+        insert_cols = ",".join(cols)
+        set_clause = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("bdu_id", "created_at"))
+
+        stmt = f"""
+        INSERT INTO bdu_vulns ({insert_cols})
+        VALUES %s
+        ON CONFLICT (bdu_id) DO UPDATE
+          SET {set_clause};
+        """
+
+        with conn.cursor() as cur:
+            execute_values(cur, stmt, values, page_size=100)
+        conn.commit()
+  celery_app.py: |
+    import os
+    from celery import Celery
+
+    celery = Celery(
+        "bdu_scraper",
+        broker=os.getenv("CELERY_BROKER_URL"),
+        backend=os.getenv("CELERY_RESULT_BACKEND"),
+        include=["tasks"]
+    )
+
+    celery.conf.task_track_started = True
+    celery.conf.result_expires = 3600
+
+    import tasks
+  docker-compose.yml: "version: \"3.9\"\n\nservices:\n  postgres:\n    image: postgres:15\n    restart: always\n    environment:\n      POSTGRES_USER: bdu_user\n      POSTGRES_PASSWORD: bdu_pass\n      POSTGRES_DB: bdu_db\n    ports:\n      - \"5432:5432\"\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n\n  redis:\n    image: redis:7\n    restart: always\n    ports:\n      - \"6379:6379\"\n\n  api:\n    image: sirartem001/scrapers-api:v1 # Добавил в registry свой код\n    restart: always\n    environment:\n      DATABASE_DSN: postgres://bdu_user:bdu_pass@postgres:5432/bdu_db\n      CELERY_BROKER_URL: redis://redis:6379/0\n      CELERY_RESULT_BACKEND: redis://redis:6379/0\n    depends_on:\n      - postgres\n      - redis\n    volumes:\n      - .:/app   \n      - /app/__pycache__/\n    ports:\n      - \"8000:8000\"\n    command: [\"uvicorn\", \"api:app\", \"--host\", \"0.0.0.0\", \"--port\", \"8000\", \"--reload\"]\n\n  worker:\n    build: .\n    restart: always\n    environment:\n      DATABASE_DSN: postgres://bdu_user:bdu_pass@postgres:5432/bdu_db\n      CELERY_BROKER_URL: redis://redis:6379/0\n      CELERY_RESULT_BACKEND: redis://redis:6379/0\n    depends_on:\n      - api\n      - redis\n      - postgres\n    volumes:\n      - .:/app\n    command: [\"celery\", \"-A\", \"celery_app\", \"worker\", \"--loglevel=INFO\"]\n\nvolumes:\n  pgdata:\n"
+  nvd.py: |+
+    import time
+    import requests
+    import psycopg2
+    from psycopg2.extras import Json, execute_values
+    from celery_app import celery
+    import os
+    from logging import getLogger
+
+    API_URL = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
+    API_KEY = os.getenv("NVD_API_KEY")
+    logger = getLogger(__name__)
+    DB_DSN = os.getenv("DATABASE_DSN")
+    SLEEP_BETWEEN_REQUESTS = float(os.getenv("SLEEP_BETWEEN_REQUESTS", "0.8"))
+    CHUNK_SIZE = 500
+    MAX_RETRIES = 5
+    BACKOFF_INITIAL = 1.0
+
+    def fetch_cpes_chunk(start_index: int, results_per_page: int):
+        params = {"startIndex": start_index, "resultsPerPage": results_per_page}
+        headers = {"apiKey": API_KEY} if API_KEY else {}
+
+        backoff = BACKOFF_INITIAL
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.get(API_URL, params=params, headers=headers, timeout=30)
+
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    wait = float(retry_after) if retry_after else backoff
+                    logger.warning(f"429 Too Many Requests, wait {wait}s")
+                    time.sleep(wait)
+                    backoff *= 2
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+                return data
+
+            except requests.RequestException as e:
+                logger.warning(f"Request failed ({attempt}/{MAX_RETRIES}): {e}")
+                time.sleep(backoff)
+                backoff *= 2
+
+        raise RuntimeError(f"Failed to fetch CPE chunk after {MAX_RETRIES} retries")
+
+
+    def upsert_cpes_to_db(cpe_products, conn):
+        insert_sql = """
+        INSERT INTO nvd_cpes (
+            cpe_name_id,
+            cpe_name,
+            created,
+            last_modified,
+            deprecated,
+            deprecated_by,
+            titles,
+            raw
+        )
+        VALUES %s
+        ON CONFLICT (cpe_name_id)
+        DO UPDATE SET
+            cpe_name = EXCLUDED.cpe_name,
+            created = EXCLUDED.created,
+            last_modified = EXCLUDED.last_modified,
+            deprecated = EXCLUDED.deprecated,
+            deprecated_by = EXCLUDED.deprecated_by,
+            titles = EXCLUDED.titles,
+            raw = EXCLUDED.raw;
+        """
+
+        rows = []
+        for prod in cpe_products:
+            cpe = prod.get("cpe", {})
+            cpe_name_id = cpe.get("cpeNameId")
+            cpe_name = cpe.get("cpeName")
+            created = cpe.get("created")
+            last_modified = cpe.get("lastModified")
+            deprecated = cpe.get("deprecated", False)
+            # Оборачиваем deprecated_by тоже, если это не None
+            deprecated_by = cpe.get("deprecatedBy", None)
+            if deprecated_by is not None:
+                deprecated_by_json = Json(deprecated_by)
+            else:
+                deprecated_by_json = None
+
+            titles = cpe.get("titles")
+            raw = cpe
+
+            rows.append((
+                cpe_name_id,
+                cpe_name,
+                created,
+                last_modified,
+                deprecated,
+                deprecated_by_json,
+                Json(titles),
+                Json(raw),
+            ))
+
+        with conn.cursor() as cur:
+            execute_values(cur, insert_sql, rows)
+        conn.commit()
+
+
+    @celery.task(bind=True, rate_limit="20/m")
+    def fetch_and_store_cpe_chunk(self, start_index: int = 0):
+        try:
+            resp = fetch_cpes_chunk(start_index, CHUNK_SIZE)
+            total = resp.get("totalResults")
+            products = resp.get("products", [])
+
+            if not products:
+                return {"start_index": start_index, "saved": 0, "message": "no records"}
+
+            conn = psycopg2.connect(DB_DSN)
+            upsert_cpes_to_db(products, conn)
+            conn.close()
+
+            return {"start_index": start_index, "saved": len(products), "total": total}
+        except Exception as exc:
+            logger.exception("Failed to fetch and store CPE chunk")
+            raise self.retry(exc=exc, countdown=10, max_retries=5)
+
+  requirements.txt: |-
+    fastapi
+    uvicorn
+    celery[redis]
+    psycopg2-binary
+    beautifulsoup4
+    lxml
+    playwright
+    python-dotenv
+    requests
+  tasks.py: |
+    import psycopg2
+    from playwright.sync_api import sync_playwright
+    from bdu import fetch_rendered, parse_list_page, parse_vuln_page, store_bulk
+    from nvd import fetch_and_store_cpe_chunk, fetch_cpes_chunk
+    from celery_app import celery
+    import os
+
+    DB_DSN = os.getenv("DATABASE_DSN")
+    API_URL = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
+    API_KEY = os.getenv("NVD_API_KEY")
+    CHUNK_SIZE = 500
+
+    @celery.task(bind=True, rate_limit="30/m")
+    def fetch_and_store_vuln(self, url: str):
+        """Скачать страницу уязвимости и сохранить её в БД."""
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                context = browser.new_context(ignore_https_errors=True)
+                page = context.new_page()
+
+                html = fetch_rendered(page, url, wait_selector="tr, h1", timeout=60000)
+                item = parse_vuln_page(html, url)
+
+                conn = psycopg2.connect(DB_DSN)
+                store_bulk(conn, [item])
+                conn.close()
+
+                context.close()
+                browser.close()
+
+                return {"bdu_id": item["bdu_id"]}
+        except Exception as exc:
+            raise self.retry(exc=exc, countdown=15, max_retries=3)
+
+
+    @celery.task(bind=True)
+    def enqueue_vuln_links(self, page_number: int = 1):
+        """Парсит страницу списка и ставит задачи fetch_and_store_vuln для каждой ссылки."""
+        from bdu import BASE_URL, LIST_PATH
+
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                context = browser.new_context(ignore_https_errors=True)
+                page = context.new_page()
+
+                list_url = f"{BASE_URL.rstrip('/')}{LIST_PATH}"
+                if page_number > 1:
+                    list_url = f"{list_url}?page={page_number}"
+
+                html = fetch_rendered(page, list_url, wait_selector="ul.list-news, table", timeout=60000)
+                links = parse_list_page(html)
+
+                for link in links:
+                    fetch_and_store_vuln.delay(link)
+
+                context.close()
+                browser.close()
+
+            return {"page": page_number, "count": len(links)}
+        except Exception as exc:
+            raise self.retry(exc=exc, countdown=15, max_retries=3)
+
+
+    @celery.task(bind=True)
+    def enqueue_all_bdu_pages(self, start_page: int = 1, max_pages: int | None = None):
+        """Проходит все страницы списка БДУ и ставит задачи на enqueue_vuln_links."""
+        from bdu import BASE_URL, LIST_PATH
+
+        page_number = start_page
+        total_pages = 0
+
+        try:
+            while True:
+                enqueue_vuln_links.delay(page_number)
+                total_pages += 1
+
+                if max_pages and page_number >= max_pages:
+                    break
+
+                page_number += 1
+
+                if total_pages % 20 == 0:
+                    celery.control.purge()
+
+            return {"pages_enqueued": total_pages}
+        except Exception as exc:
+            raise self.retry(exc=exc, countdown=60, max_retries=3)
+
+
+    @celery.task(bind=True)
+    def enqueue_cpe_chunks(self):
+        """Ставит задачи на загрузку CPE чанков из NVD."""
+        try:
+            resp = fetch_cpes_chunk(0, CHUNK_SIZE)
+            total = resp.get("totalResults")
+            if total is None:
+                raise RuntimeError("Не удалось получить totalResults из API")
+
+            start = 0
+            count = 0
+            while start < total:
+                fetch_and_store_cpe_chunk.delay(start)
+                count += 1
+                start += CHUNK_SIZE
+
+            return {"total": total, "tasks_scheduled": count}
+        except Exception as exc:
+            raise self.retry(exc=exc, countdown=30, max_retries=3)
+kind: ConfigMap
+metadata:
+  labels:
+    io.kompose.service: worker
+  name: worker-cm0

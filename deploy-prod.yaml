@@ -1,0 +1,45 @@
+---
+- name: Deploy application to Minikube
+  hosts: localhost
+  connection: local
+  vars:
+    kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('~/.kube/config', true) }}"
+    manifests_path: "./deploy"
+
+  tasks:
+    - name: Проверяем доступность kubectl
+      command: kubectl version --client=true
+      register: kubectl_check
+      changed_when: false
+
+    - name: Применяем все манифесты в {{ manifests_path }}
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        namespace: default
+        src: "{{ item }}"
+      loop: "{{ lookup('fileglob', manifests_path + '/*.yaml', wantlist=True) }}"
+      when: item is search('.yaml$')
+
+
+    - name: Ожидаем готовности всех подов
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        kind: Pod
+      register: pod_info
+      until: >
+        pod_info.resources is defined and
+        (
+          pod_info.resources | selectattr('status.phase', 'equalto', 'Running') | list | length
+        ) >= 3
+      retries: 10
+      delay: 10
+
+
+    - name: Показываем активные сервисы
+      command: kubectl get svc -o wide
+      register: svc_output
+      changed_when: false
+
+    - debug:
+        msg: "{{ svc_output.stdout_lines }}"
